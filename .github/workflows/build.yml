@@ -4,6 +4,19 @@ name: build
 
 on:
   workflow_dispatch:
+    inputs:
+      macos:
+        description: "macOS (los minutos cuentan x10 en repos privados)"
+        type: boolean
+        default: false
+      windows:
+        description: "Windows"
+        type: boolean
+        default: true
+      linux:
+        description: "Linux"
+        type: boolean
+        default: true
   push:
     tags: ["v*"]
 
@@ -13,6 +26,7 @@ env:
 
 jobs:
   macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-14 # Apple Silicon; el .app resultante requiere macOS 14+
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +46,7 @@ jobs:
           path: src-tauri/target/release/bundle/*.dmg
 
   linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +71,7 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
 
   windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
