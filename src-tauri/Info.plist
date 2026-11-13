@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>TransmitIA usa la cámara o capturadora como fuente de video. / TransmitIA uses the camera or capture card as a video source.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>TransmitIA usa el micrófono como fuente de audio. / TransmitIA uses the microphone as an audio source.</string>
+</dict>
+</plist>

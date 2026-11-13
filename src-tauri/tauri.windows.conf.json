@@ -1,0 +1,13 @@
+{
+  "bundle": {
+    "resources": {
+      "C:/gstreamer/1.0/msvc_x86_64/bin/*.dll": "./",
+      "C:/gstreamer/1.0/msvc_x86_64/libexec/gstreamer-1.0/gst-plugin-scanner.exe": "./",
+      "C:/gstreamer/1.0/msvc_x86_64/lib/gstreamer-1.0/*.dll": "gstreamer-1.0/",
+      "C:/gstreamer/1.0/msvc_x86_64/lib/gio/modules/*.dll": "gio/modules/"
+    },
+    "windows": {
+      "nsis": { "installMode": "perMachine" }
+    }
+  }
+}
