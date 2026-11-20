@@ -27,7 +27,8 @@
           "$PICTURE/TransmitIA/**"
         ]
       }
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

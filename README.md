@@ -9,7 +9,7 @@ App de transmisión minimalista (tipo OBS) con funciones de IA. Hecha con Tauri 
 - Cada capa se mueve y redimensiona sobre la vista previa (imán a bordes/centro, Shift mantiene proporción) y tiene ajuste: encajar, rellenar (recorte) o estirar.
 - Cambiar de escena, mover, redimensionar, ocultar o reordenar capas se aplica en vivo sin cortar la transmisión. Agregar/quitar fuentes reinicia la vista previa (bloqueado mientras se transmite).
 - Una fuente usada en varias capas/escenas se abre una sola vez.
-- Mezclador de audio: varias entradas (micrófonos, tono de prueba; audio del sistema en Windows) con volumen, silencio y medidor por entrada, en vivo.
+- Mezclador de audio: varias entradas (micrófonos, tono de prueba; audio del sistema en macOS 14.2+ con Core Audio process taps y en Windows con WASAPI loopback) con volumen, silencio y medidor por entrada, en vivo.
 - Salida: 1080p/720p · 30/60 fps · 16:9 o 9:16.
 - Encoder H.264 por hardware con detección automática: VideoToolbox (macOS), NVENC/QSV/AMF/Media Foundation (Windows), VA-API/NVENC (Linux), con x264 como respaldo.
 - Multidestino: varios RTMP/RTMPS o SRT a la vez (URL + clave por destino, guardada en el llavero del sistema). Se codifica una sola vez; cada destino tiene su propia conexión con reconexión automática cada 3 s y estado/bitrate propio, así que si uno falla los demás siguen.
@@ -38,6 +38,13 @@ App de transmisión minimalista (tipo OBS) con funciones de IA. Hecha con Tauri 
 - Gemini (Nano Banana, `generateContent` con `imageConfig.aspectRatio`) u OpenAI (GPT Image, `/v1/images/edits`). Aspecto como el lienzo (16:9 o 9:16) o 1:1; calidad baja/media/alta; generación automática cada N minutos.
 - Galería en `~/Pictures/TransmitIA` (imagen + metadatos). "Agregar a la escena" pone el póster como capa; en vivo se inserta sin cortar la transmisión.
 - La barra lateral se organiza en pestañas: Escena, Salida e IA.
+
+### Vista previa con GPU (macOS)
+
+- Las capas se componen en la GPU con `glvideomixer` (recorte y ajuste incluidos) y la vista previa se dibuja con `glimagesink` en una vista nativa colocada detrás del webview transparente, como OBS: sin JPEG ni copias a la CPU, a la tasa completa del lienzo.
+- El encoder recibe NV12 convertido en la GPU (`glcolorconvert → gldownload`); las capturas del programa bajan un cuadro solo cuando se piden.
+- Medido con cámara 720p60: la app pasó de ~192 % a ~18 % de CPU y la vista previa de 15 a 60 cuadros/s.
+- `TRANSMITIA_CPU_PREVIEW=1` fuerza la ruta anterior (CPU + JPEG). Windows y Linux usan esa ruta por ahora.
 
 ## Requisitos
 
@@ -98,11 +105,11 @@ Solo `TransmitIA.app` tiene permiso de cámara. Para probar el motor con una cá
 open src-tauri/target/debug/bundle/macos/TransmitIA.app --env TRANSMITIA_SELFTEST=dev:0 --env TRANSMITIA_DUMP_DIR=/tmp/transmitia-dump
 ```
 
-El log queda en `~/Library/Logs/edu.asu.transmitia/transmitia.log`.
+El log queda en `~/Library/Logs/edu.asu.transmitia/transmitia.log`. `TRANSMITIA_SETTINGS=/ruta/settings.json` abre la app con otra configuración sin modificar la del usuario.
 
 ## Próximas fases
 
-Pendiente de fase 2: audio del sistema en macOS (ScreenCaptureKit) y captura de una ventana específica.
+Pendiente de fase 2: captura de una ventana específica.
 
 - Verificar y ajustar las compilaciones de Windows y Linux en CI.
 - Firma con Developer ID y notarización en macOS; firma de código en Windows.

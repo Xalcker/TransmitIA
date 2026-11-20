@@ -25,12 +25,13 @@ from pathlib import Path
 PLUGINS = [
     "app", "applemedia", "audioconvert", "audiomixer", "audioparsers", "audioresample",
     "audiotestsrc", "closedcaption", "compositor", "coreelements", "debug", "faac", "flv",
-    "imagefreeze", "jpeg", "libav", "matroska", "mpegtsmux", "osxaudio", "pango", "png",
+    "imagefreeze", "jpeg", "libav", "matroska", "mpegtsmux", "opengl", "osxaudio", "pango", "png",
     "rsclosedcaption", "rtmp2", "srt", "typefindfunctions", "videobox", "videoconvertscale",
     "videoparsersbad", "videorate", "videotestsrc", "volume", "x264",
 ]
 
 EXTERNAL_PREFIXES = ("/opt/homebrew/", "/usr/local/")
+ENTITLEMENTS = Path(__file__).resolve().parent.parent / "src-tauri/entitlements.plist"
 
 
 def sh(*args: str) -> str:
@@ -159,8 +160,12 @@ def main() -> None:
         if dst == exe:
             continue
         identity = os.environ.get("APPLE_SIGNING_IDENTITY") or "-"
-        subprocess.run(["codesign", "--force", "--options", "runtime", "--timestamp=none" if identity == "-" else "--timestamp",
-                        "--sign", identity, str(dst)], check=True, capture_output=True)
+        args = ["codesign", "--force", "--options", "runtime", "--timestamp=none" if identity == "-" else "--timestamp"]
+        # Los ejecutables (gst-plugin-scanner) cargan plugins: con hardened runtime
+        # necesitan el mismo permiso que la app para librerías de otra firma.
+        if dst.suffix not in (".dylib", ".so"):
+            args += ["--entitlements", str(ENTITLEMENTS)]
+        subprocess.run(args + ["--sign", identity, str(dst)], check=True, capture_output=True)
     print(f"plugins: {len(PLUGINS)}  librerías: {len(copied)}")
 
 

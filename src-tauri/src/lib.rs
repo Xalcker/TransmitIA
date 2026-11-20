@@ -1,7 +1,10 @@
 mod engine;
 mod gst_env;
 mod log;
+#[cfg(target_os = "macos")]
+mod macos_audio;
 mod media;
+mod native_preview;
 mod outputs;
 mod poster;
 mod permissions;
@@ -45,7 +48,7 @@ struct Sources {
 #[tauri::command]
 async fn list_sources(state: State<'_, AppState>, refresh: bool) -> CmdResult<Sources> {
     let mut eng = state.engine.lock();
-    if refresh {
+    if refresh || !eng.devices.refreshed {
         eng.devices.refresh();
     }
     Ok(Sources { video: eng.devices.video_sources(), audio: eng.devices.audio_sources() })
@@ -101,7 +104,9 @@ async fn engine_mode(state: State<'_, AppState>) -> CmdResult<Mode> {
 
 #[tauri::command]
 async fn load_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
-    Ok(std::fs::read_to_string(&state.settings_path)
+    // Diagnóstico: TRANSMITIA_SETTINGS=/ruta/settings.json usa otra configuración.
+    let path = std::env::var_os("TRANSMITIA_SETTINGS").map(PathBuf::from).unwrap_or_else(|| state.settings_path.clone());
+    Ok(std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
         .unwrap_or_default()
@@ -110,6 +115,9 @@ async fn load_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
 
 #[tauri::command]
 async fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<()> {
+    if std::env::var_os("TRANSMITIA_SETTINGS").is_some() {
+        return Ok(()); // no tocar la configuración del usuario en diagnóstico
+    }
     if let Some(dir) = state.settings_path.parent() {
         std::fs::create_dir_all(dir).map_err(err)?;
     }
@@ -213,6 +221,27 @@ async fn add_layer_live(state: State<'_, AppState>, settings: Settings, layer_id
     state.engine.lock().add_layer_live(&settings, &layer_id).map_err(err)
 }
 
+/// ¿La vista previa se dibuja de forma nativa (GPU) detrás del webview?
+#[tauri::command]
+async fn native_preview_supported() -> CmdResult<bool> {
+    Ok(native_preview::gpu_enabled())
+}
+
+/// Rectángulo del lienzo en la interfaz (px CSS); `visible` = hay vista previa.
+#[tauri::command]
+async fn set_preview_rect(
+    app: tauri::AppHandle,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    page_h: f64,
+    visible: bool,
+) -> CmdResult<()> {
+    native_preview::set_rect(&app, x, y, w, h, page_h, visible);
+    Ok(())
+}
+
 #[tauri::command]
 async fn api_key_status() -> CmdResult<HashMap<String, bool>> {
     Ok(HashMap::from([
@@ -288,10 +317,13 @@ fn spawn_selftest(app: tauri::AppHandle, source: String) {
                 text: None,
             },
         ];
+        // Guarda el programa compuesto (sirve igual con composición en CPU o GPU).
         let dump = |name: &str| {
             if let Ok(dir) = std::env::var("TRANSMITIA_DUMP_DIR") {
-                let d = std::path::Path::new(&dir);
-                let _ = std::fs::copy(d.join("latest.jpg"), d.join(format!("{name}.jpg")));
+                let snaps = state.engine.lock().snapshots();
+                if let Some(jpeg) = snaps.and_then(|s| s.capture_jpeg(engine::PROGRAM, 640).ok()) {
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.jpg")), jpeg);
+                }
             }
         };
         let wait = || std::thread::sleep(std::time::Duration::from_secs(4));
@@ -313,6 +345,17 @@ fn spawn_selftest(app: tauri::AppHandle, source: String) {
             wait();
             dump(&format!("{o:?}-scene2"));
         }
+        // En vivo con grabación: verifica el camino del encoder (en GPU, NV12 convertido en la GPU).
+        if let Ok(dir) = std::env::var("TRANSMITIA_DUMP_DIR") {
+            s.recording.enabled = true;
+            s.recording.folder = dir;
+            s.active_scene = 1;
+            match state.engine.lock().start(&s, Mode::Live, engine::Secrets::default()) {
+                Ok(()) => log::write("info", "selftest live recording started"),
+                Err(e) => log::write("error", &format!("selftest live failed: {e:#}")),
+            }
+            wait();
+        }
         state.engine.lock().stop();
         log::write("info", "selftest done");
     });
@@ -327,6 +370,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             log::init(app.path().app_log_dir()?);
+            if let Some(w) = app.get_webview_window("main") {
+                native_preview::install(&w);
+            }
             log::write("info", &format!("TransmitIA {} starting", env!("CARGO_PKG_VERSION")));
             let engine = Engine::new(app.handle().clone())?;
             let settings_path = app.path().app_config_dir()?.join("settings.json");
@@ -352,6 +398,8 @@ pub fn run() {
             set_api_key,
             api_key_status,
             list_models,
+            native_preview_supported,
+            set_preview_rect,
             capture_frame,
             generate_poster,
             list_posters,

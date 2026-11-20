@@ -26,6 +26,9 @@ pub struct EncoderInfo {
 pub struct DeviceCache {
     pub video: Vec<gst::Device>,
     pub audio: Vec<gst::Device>,
+    /// La búsqueda nunca debe correr en el hilo principal (en macOS el buscador
+    /// de AVFoundation necesita ese hilo libre y se bloquea): se hace a demanda.
+    pub refreshed: bool,
 }
 
 impl DeviceCache {
@@ -38,6 +41,7 @@ impl DeviceCache {
         }
         let devices = monitor.devices();
         monitor.stop();
+        self.refreshed = true;
         self.video.clear();
         self.audio.clear();
         for d in devices {
@@ -75,9 +79,9 @@ impl DeviceCache {
 
     pub fn audio_sources(&self) -> Vec<SourceInfo> {
         let mut out = vec![SourceInfo { id: "test".into(), label: "test-tone".into(), kind: "test".into() }];
-        // Audio del sistema: Windows (WASAPI loopback). En macOS requiere
-        // ScreenCaptureKit (pendiente); en Linux aparecen los "Monitor of …".
-        if cfg!(target_os = "windows") && gst::ElementFactory::find("wasapi2src").is_some() {
+        // Audio del sistema: macOS (Core Audio taps, 14.2+) y Windows (WASAPI
+        // loopback); en Linux aparecen como dispositivos "Monitor of …".
+        if system_audio_available() {
             out.push(SourceInfo { id: "system".into(), label: "system-audio".into(), kind: "test".into() });
         }
         for (i, d) in self.audio.iter().enumerate() {
@@ -135,12 +139,7 @@ impl DeviceCache {
     pub fn make_audio_source(&self, id: &str) -> Result<Option<gst::Element>> {
         match id {
             "none" | "" => Ok(None),
-            "system" => {
-                let el = make("wasapi2src")?;
-                set_prop(&el, "loopback", "true");
-                set_prop(&el, "low-latency", "true");
-                Ok(Some(el))
-            }
+            "system" => make_system_audio().map(Some),
             "test" => {
                 let el = make("audiotestsrc")?;
                 el.set_property("is-live", true);
@@ -186,6 +185,42 @@ fn make_image_source(path: &str) -> Result<gst::Element> {
     let ghost = gst::GhostPad::with_target(&freeze.static_pad("src").unwrap())?;
     bin.add_pad(&ghost)?;
     Ok(bin.upcast())
+}
+
+// ---------- Audio del sistema por sistema operativo ----------
+
+#[cfg(target_os = "macos")]
+fn system_audio_available() -> bool {
+    crate::macos_audio::available()
+}
+
+#[cfg(target_os = "macos")]
+fn make_system_audio() -> Result<gst::Element> {
+    crate::macos_audio::make_source()
+}
+
+#[cfg(target_os = "windows")]
+fn system_audio_available() -> bool {
+    gst::ElementFactory::find("wasapi2src").is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn make_system_audio() -> Result<gst::Element> {
+    let el = make("wasapi2src")?;
+    set_prop(&el, "loopback", "true");
+    set_prop(&el, "low-latency", "true");
+    Ok(el)
+}
+
+// En Linux el audio del sistema aparece como dispositivo "Monitor of …".
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_audio_available() -> bool {
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn make_system_audio() -> Result<gst::Element> {
+    Err(anyhow!("use the \"Monitor of …\" device for system audio on Linux"))
 }
 
 // ---------- Captura de pantalla por sistema operativo ----------

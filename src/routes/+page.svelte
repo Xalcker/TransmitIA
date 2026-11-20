@@ -36,6 +36,8 @@
   let keyStatus = $state<Record<string, boolean>>({});
   let selectedId = $state<string | null>(null);
   let tab = $state<"scene" | "output" | "ai">("scene");
+  /** macOS: vista previa nativa con GPU detrás del webview. */
+  let native = $state(false);
   let addChoice = $state("");
 
   const lang = $derived<Lang>(settings?.language ?? "es");
@@ -75,6 +77,8 @@
       await listen<Stats>("stats", (e) => (stats = e.payload)),
       await listen<string>("engine-error", (e) => (error = e.payload)),
     );
+    native = await invoke<boolean>("native_preview_supported").catch(() => false);
+    document.documentElement.classList.toggle("native-preview", native);
     settings = await invoke<Settings>("load_settings");
     encoders = await invoke<EncoderInfo[]>("list_encoders");
     await refreshKeyStatus();
@@ -433,6 +437,10 @@
           onselect={(id) => (selectedId = id)}
           onrect={setRect}
           emptyText={t("no_preview")}
+          {native}
+          active={mode !== "stopped"}
+          onviewport={(r) =>
+            invoke("set_preview_rect", r ? { ...r, visible: true } : { x: 0, y: 0, w: 1, h: 1, pageH: 1, visible: false }).catch(() => {})}
         />
         {#if mode === "stopped"}
           <button class="ghost small" onclick={startPreview} disabled={busy}>{t("start_preview")}</button>
@@ -615,6 +623,7 @@
           {:else}
             <p class="hint">{t("no_audio")}</p>
           {/each}
+          {#if settings.audioInputs.some((a) => a.source === "system")}<p class="hint">{t("system_audio_hint")}</p>{/if}
           <div class="inline">
             <select bind:value={audioChoice} disabled={live}>
               <option value="">+ {t("add_audio")}…</option>
@@ -857,6 +866,12 @@
     --live: #ff3b4e;
     --ok: #3ccf8e;
     color-scheme: dark;
+  }
+  /* Vista previa nativa: la ventana es transparente y el color de fondo lo pinta
+     macOS; así el hueco del lienzo deja ver el video que está detrás. */
+  :global(html.native-preview),
+  :global(html.native-preview body) {
+    background: transparent !important;
   }
   :global(body) {
     margin: 0;

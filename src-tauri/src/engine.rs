@@ -82,9 +82,8 @@ pub struct Engine<R: Runtime = Wry> {
 impl<R: Runtime> Engine<R> {
     pub fn new(app: AppHandle<R>) -> Result<Self> {
         gst::init().context("GStreamer init failed")?;
-        let mut devices = DeviceCache::default();
-        devices.refresh();
-        Ok(Self { app, devices, running: None })
+        // Los dispositivos se buscan después, fuera del hilo principal (ver DeviceCache).
+        Ok(Self { app, devices: DeviceCache::default(), running: None })
     }
 
     pub fn mode(&self) -> Mode {
@@ -94,6 +93,9 @@ impl<R: Runtime> Engine<R> {
     /// Arranca (o reinicia) en modo vista previa o en vivo.
     pub fn start(&mut self, settings: &Settings, mode: Mode, secrets: Secrets) -> Result<()> {
         self.stop();
+        if !self.devices.refreshed {
+            self.devices.refresh();
+        }
         if mode == Mode::Stopped {
             return Ok(());
         }
@@ -117,6 +119,7 @@ impl<R: Runtime> Engine<R> {
             anyhow!("could not start pipeline (device busy or permission denied?)")
         })?;
 
+        crate::native_preview::refit_soon(&self.app);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let bus_thread = spawn_bus_thread(
             self.app.clone(),
@@ -195,10 +198,10 @@ impl<R: Runtime> Engine<R> {
             f.set_property("caps", caps);
             chain.push(f);
         }
-        let q = make("queue")?;
-        let conv = make("videoconvert")?;
-        let vbox = make("videobox")?;
-        chain.extend([q.clone(), conv, vbox.clone()]);
+        let gpu = run.layout.lock().gpu;
+        let (branch, vbox) = layer_branch(gpu)?;
+        let q = branch[0].clone();
+        chain.extend(branch);
         pipeline.add_many(&chain)?;
         gst::Element::link_many(&chain)?;
         let lay = run.layout.clone();
@@ -216,7 +219,7 @@ impl<R: Runtime> Engine<R> {
             gst::PadProbeReturn::Ok
         });
         let pad = mix.request_pad_simple("sink_%u").ok_or_else(|| anyhow!("compositor pad"))?;
-        vbox.static_pad("src").unwrap().link(&pad)?;
+        chain.last().unwrap().static_pad("src").unwrap().link(&pad)?;
         {
             let mut l = run.layout.lock();
             l.handles.insert(layer.id.clone(), LayerHandle { pad, vbox, source: layer.source.clone() });
@@ -270,7 +273,11 @@ impl<R: Runtime> Engine<R> {
         let fps = s.fps() as i32;
 
         // ---------- Video: fuentes → capas → compositor → lienzo ----------
-        let mix = gst::ElementFactory::make("compositor").name("mix").build()?;
+        // macOS: composición en la GPU (glvideomixer) y vista previa nativa.
+        let gpu = crate::native_preview::gpu_enabled();
+        crate::log::write("info", if gpu { "compositing: GPU (glvideomixer) + native preview" } else { "compositing: CPU (compositor)" });
+        let mixer_name = if gpu { "glvideomixer" } else { "compositor" };
+        let mix = gst::ElementFactory::make(mixer_name).name("mix").build()?;
         set_prop(&mix, "background", "black");
         // No esperar a fuentes que tardan en arrancar (p. ej. cámaras).
         set_prop(&mix, "ignore-inactive-pads", "true");
@@ -280,12 +287,14 @@ impl<R: Runtime> Engine<R> {
         let bg = make("videotestsrc")?;
         bg.set_property("is-live", true);
         set_prop(&bg, "pattern", "black");
+        // En GPU basta un cuadro diminuto que la GPU escala al lienzo.
+        let (bw, bh) = if gpu { (16, 16) } else { (w as i32, h as i32) };
         let bg_caps = make("capsfilter")?;
         bg_caps.set_property(
             "caps",
             gst::Caps::builder("video/x-raw")
-                .field("width", w as i32)
-                .field("height", h as i32)
+                .field("width", bw)
+                .field("height", bh)
                 .field("framerate", gst::Fraction::new(fps, 1))
                 .build(),
         );
@@ -294,8 +303,10 @@ impl<R: Runtime> Engine<R> {
         let bg_pad = mix.request_pad_simple("sink_%u").ok_or_else(|| anyhow!("compositor pad"))?;
         bg_caps.static_pad("src").unwrap().link(&bg_pad)?;
         bg_pad.set_property("zorder", 0u32);
+        bg_pad.set_property("width", w as i32);
+        bg_pad.set_property("height", h as i32);
 
-        let layout = Arc::new(Mutex::new(Layout { canvas: (w, h), ..Default::default() }));
+        let layout = Arc::new(Mutex::new(Layout { canvas: (w, h), gpu, ..Default::default() }));
         let mut levels: Vec<(String, Arc<Peak>)> = Vec::new();
         let snapshots = Arc::new(Snapshots::default());
 
@@ -359,36 +370,51 @@ impl<R: Runtime> Engine<R> {
         // Una rama por capa (de todas las escenas); las inactivas quedan con alpha 0.
         for layer in s.scenes.iter().flat_map(|sc| sc.layers.iter()) {
             let Some(tee) = source_tees.get(&layer.source) else { continue };
-            let q = leaky_queue()?;
-            let conv = make("videoconvert")?;
-            // videobox recorta copiando píxeles (videocrop falla con búferes de AVFoundation).
-            let vbox = make("videobox")?;
-            pipeline.add_many([&q, &conv, &vbox])?;
-            gst::Element::link_many([tee, &q, &conv, &vbox])?;
+            let (branch, vbox) = layer_branch(gpu)?;
+            pipeline.add_many(&branch)?;
+            tee.link(&branch[0])?;
+            gst::Element::link_many(&branch)?;
             let pad = mix.request_pad_simple("sink_%u").ok_or_else(|| anyhow!("compositor pad"))?;
-            vbox.static_pad("src").unwrap().link(&pad)?;
+            branch.last().unwrap().static_pad("src").unwrap().link(&pad)?;
             layout.lock().handles.insert(
                 layer.id.clone(),
                 LayerHandle { pad, vbox, source: layer.source.clone() },
             );
         }
         let vcaps = make("capsfilter")?;
-        vcaps.set_property(
-            "caps",
-            gst::Caps::builder("video/x-raw")
-                .field("width", w as i32)
-                .field("height", h as i32)
-                .field("framerate", gst::Fraction::new(fps, 1))
-                .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-                .build(),
-        );
+        let mut canvas_caps = gst::Caps::builder("video/x-raw")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", gst::Fraction::new(fps, 1))
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build();
+        if gpu {
+            canvas_caps.get_mut().unwrap().set_features(0, Some(gst::CapsFeatures::new(["memory:GLMemory"])));
+        }
+        vcaps.set_property("caps", canvas_caps);
         let vtee = make("tee")?;
         set_prop(&vtee, "allow-not-linked", "true");
         pipeline.add_many([&vcaps, &vtee])?;
         gst::Element::link_many([&mix, &vcaps, &vtee])?;
 
-        // "program" = el lienzo compuesto tal como sale al aire.
-        snapshots.install(&vcaps.static_pad("src").unwrap(), PROGRAM.into());
+        // "program" = el lienzo compuesto tal como sale al aire. En GPU se baja a
+        // memoria solo cuando alguien pide una captura (válvula cerrada el resto).
+        if gpu {
+            let q = leaky_queue()?;
+            let valve = make("valve")?;
+            valve.set_property("drop", true);
+            let down = make("gldownload")?;
+            let conv = make("videoconvert")?;
+            let sink = make("fakesink")?;
+            set_prop(&sink, "sync", "false");
+            set_prop(&sink, "async", "false");
+            pipeline.add_many([&q, &valve, &down, &conv, &sink])?;
+            gst::Element::link_many([&vtee, &q, &valve, &down, &conv, &sink])?;
+            snapshots.install(&sink.static_pad("sink").unwrap(), PROGRAM.into());
+            *snapshots.program_valve.lock() = Some(valve);
+        } else {
+            snapshots.install(&vcaps.static_pad("src").unwrap(), PROGRAM.into());
+        }
 
         // Contador de cuadros a la salida del lienzo.
         {
@@ -400,7 +426,11 @@ impl<R: Runtime> Engine<R> {
         }
 
         // ---------- Vista previa ----------
-        self.add_preview_branch(&pipeline, &vtee, w, h, counters)?;
+        if gpu {
+            self.add_native_preview(&pipeline, &vtee, counters)?;
+        } else {
+            self.add_preview_branch(&pipeline, &vtee, w, h, counters)?;
+        }
 
         // ---------- Audio: entradas → mezclador ----------
         let has_audio = !s.audio_inputs.is_empty();
@@ -516,6 +546,20 @@ impl<R: Runtime> Engine<R> {
         // ---------- Codificación (una sola vez para todas las salidas) ----------
         let venc_q = make("queue")?;
         let venc_conv = make("videoconvert")?;
+        // GPU: convertir a NV12 en la GPU y bajar una sola copia para el encoder.
+        let gl_down: Vec<gst::Element> = if gpu {
+            let cc = make("glcolorconvert")?;
+            let caps = make("capsfilter")?;
+            caps.set_property(
+                "caps",
+                gst::Caps::builder("video/x-raw").features(["memory:GLMemory"]).field("format", "NV12").build(),
+            );
+            let down = make("gldownload")?;
+            vec![cc, caps, down]
+        } else {
+            Vec::new()
+        };
+        pipeline.add_many(&gl_down)?;
         let (venc, enc_name) = media::make_video_encoder(s.encoder.as_deref(), s.video_bitrate(), s.fps())?;
         let vparse = make("h264parse")?;
         set_prop(&vparse, "config-interval", "-1");
@@ -552,7 +596,10 @@ impl<R: Runtime> Engine<R> {
             // Las colas dan margen de latencia a los agregadores (sin ellas descartan subtítulos).
             let ccq = make("queue")?;
             pipeline.add_many([&comb, &inserter, &mux, &ccconv, &cccaps, &ccq])?;
-            gst::Element::link_many([&vtee, &venc_q, &comb, &venc_conv, &venc, &vparse, &inserter, &vcaps_out, vsink.upcast_ref()])?;
+            let mut chain = vec![vtee.clone(), venc_q.clone()];
+            chain.extend(gl_down.iter().cloned());
+            chain.extend([comb.clone(), venc_conv.clone(), venc.clone(), vparse.clone(), inserter.clone(), vcaps_out.clone(), vsink.clone().upcast()]);
+            gst::Element::link_many(&chain)?;
             gst::Element::link_many([&mux, &ccconv, &cccaps, &ccq])?;
             ccq.static_pad("src").unwrap().link(&comb.request_pad_simple("caption").ok_or_else(|| anyhow!("cccombiner caption pad"))?)?;
 
@@ -591,7 +638,10 @@ impl<R: Runtime> Engine<R> {
             t.original_to = orig_ch;
             t.translation_to = tr_ch;
         } else {
-            gst::Element::link_many([&vtee, &venc_q, &venc_conv, &venc, &vparse, &vcaps_out, vsink.upcast_ref()])?;
+            let mut chain = vec![vtee.clone(), venc_q.clone()];
+            chain.extend(gl_down.iter().cloned());
+            chain.extend([venc_conv.clone(), venc.clone(), vparse.clone(), vcaps_out.clone(), vsink.clone().upcast()]);
+            gst::Element::link_many(&chain)?;
         }
         built.encoder = Some(enc_name);
         {
@@ -700,6 +750,30 @@ impl<R: Runtime> Engine<R> {
                 })
                 .build(),
         );
+        Ok(())
+    }
+
+    /// Vista previa nativa: glimagesink dibuja en la NSView detrás del webview.
+    fn add_native_preview(&self, pipeline: &gst::Pipeline, vtee: &gst::Element, counters: &Arc<Counters>) -> Result<()> {
+        use gstreamer_video::prelude::VideoOverlayExtManual;
+        let handle = crate::native_preview::handle().ok_or_else(|| anyhow!("native preview unavailable"))?;
+        let q = leaky_queue()?;
+        let sink = gst::ElementFactory::make("glimagesink").name("preview").build()?;
+        set_prop(&sink, "sync", "false");
+        set_prop(&sink, "handle-events", "false");
+        set_prop(&sink, "force-aspect-ratio", "true");
+        let overlay = sink
+            .clone()
+            .dynamic_cast::<gstreamer_video::VideoOverlay>()
+            .map_err(|_| anyhow!("glimagesink without VideoOverlay"))?;
+        unsafe { overlay.set_window_handle(handle) };
+        pipeline.add_many([&q, &sink])?;
+        gst::Element::link_many([vtee, &q, &sink])?;
+        let c = counters.clone();
+        q.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.preview_frames.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
         Ok(())
     }
 
@@ -854,6 +928,8 @@ pub const PROGRAM: &str = "program";
 /// solo cuando alguien lo pidió (sin costo el resto del tiempo).
 #[derive(Default)]
 pub struct Snapshots {
+    /// GPU: válvula que deja pasar cuadros del programa solo al capturar.
+    program_valve: Mutex<Option<gst::Element>>,
     pending: AtomicBool,
     waiting: Mutex<HashMap<String, Vec<std::sync::mpsc::Sender<gst::Sample>>>>,
 }
@@ -887,9 +963,15 @@ impl Snapshots {
         let (tx, rx) = std::sync::mpsc::channel();
         self.waiting.lock().entry(key.to_string()).or_default().push(tx);
         self.pending.store(true, Ordering::Relaxed);
-        let sample = rx
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|_| anyhow!("no frame from source {key} (is it in a scene and running?)"))?;
+        let valve = (key == PROGRAM).then(|| self.program_valve.lock().clone()).flatten();
+        if let Some(v) = &valve {
+            v.set_property("drop", false);
+        }
+        let got = rx.recv_timeout(Duration::from_secs(3));
+        if let Some(v) = &valve {
+            v.set_property("drop", true);
+        }
+        let sample = got.map_err(|_| anyhow!("no frame from source {key} (is it in a scene and running?)"))?;
         let caps = sample.caps().ok_or_else(|| anyhow!("frame without caps"))?;
         let st = caps.structure(0).ok_or_else(|| anyhow!("frame without caps"))?;
         let (w, h) = (st.get::<i32>("width")? as u32, st.get::<i32>("height")? as u32);
@@ -1097,8 +1179,24 @@ struct StatsMeta {
 
 struct LayerHandle {
     pad: gst::Pad,
-    vbox: gst::Element,
+    /// Solo en CPU: el recorte de "Rellenar" se hace con videobox. En GPU se usan
+    /// las propiedades crop-* del pad de glvideomixer.
+    vbox: Option<gst::Element>,
     source: String,
+}
+
+/// Rama de una capa hasta el mezclador: devuelve elementos (en orden) y el
+/// videobox si aplica.
+fn layer_branch(gpu: bool) -> Result<(Vec<gst::Element>, Option<gst::Element>)> {
+    let q = leaky_queue()?;
+    if gpu {
+        // glvideomixer sube a la GPU y convierte el formato por su cuenta.
+        return Ok((vec![q], None));
+    }
+    let conv = make("videoconvert")?;
+    // videobox recorta copiando píxeles (videocrop falla con búferes de AVFoundation).
+    let vbox = make("videobox")?;
+    Ok((vec![q, conv, vbox.clone()], Some(vbox)))
 }
 
 #[derive(Clone)]
@@ -1113,6 +1211,8 @@ struct LayerSpec {
 #[derive(Default)]
 struct Layout {
     canvas: (u32, u32),
+    /// Composición en GPU (glvideomixer).
+    gpu: bool,
     handles: HashMap<String, LayerHandle>,
     specs: HashMap<String, LayerSpec>,
     src_dims: HashMap<String, (i32, i32)>,
@@ -1236,8 +1336,15 @@ impl Layout {
                 _ => [0; 4],
             };
             for (prop, v) in ["left", "right", "top", "bottom"].iter().zip(crop) {
-                if h.vbox.property::<i32>(prop) != v {
-                    h.vbox.set_property(prop, v);
+                match &h.vbox {
+                    Some(vb) => {
+                        if vb.property::<i32>(prop) != v {
+                            vb.set_property(prop, v);
+                        }
+                    }
+                    None => {
+                        set_prop(&h.pad, &format!("crop-{prop}"), &v.to_string());
+                    }
                 }
             }
         }
